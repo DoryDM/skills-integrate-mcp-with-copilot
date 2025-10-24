@@ -5,11 +5,20 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
+import json
+import uuid
+from typing import Optional
+
+# Simple in-memory session store for admin tokens -> username
+sessions = {}
+
+# Teachers store will be loaded from src/teachers.json
+teachers = {}
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -83,14 +92,49 @@ def root():
     return RedirectResponse(url="/static/index.html")
 
 
+def load_teachers():
+    """Load teachers from `src/teachers.json`. For this exercise we store
+    plaintext passwords in the JSON. Replace with hashed passwords in production."""
+    global teachers
+    try:
+        base = Path(__file__).parent
+        with open(base / "teachers.json", "r", encoding="utf-8") as f:
+            teachers = json.load(f)
+    except Exception:
+        # if file is missing, default to empty
+        teachers = {}
+
+
+def get_token_from_request(request: Request) -> Optional[str]:
+    # token can be provided as an http-only cookie or an X-Admin-Token header
+    token = request.cookies.get("admin_token")
+    if not token:
+        token = request.headers.get("X-Admin-Token")
+    return token
+
+
+def require_teacher(request: Request):
+    token = get_token_from_request(request)
+    if not token or token not in sessions:
+        raise HTTPException(status_code=401, detail="Admin authentication required")
+    return sessions[token]
+
+
+@app.on_event("startup")
+def startup_event():
+    load_teachers()
+
+
 @app.get("/activities")
 def get_activities():
     return activities
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
-    """Sign up a student for an activity"""
+def signup_for_activity(activity_name: str, email: str, request: Request):
+    """Sign up a student for an activity. Restricted to logged-in teachers (admin)."""
+    # require teacher permissions
+    require_teacher(request)
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +155,10 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
-    """Unregister a student from an activity"""
+def unregister_from_activity(activity_name: str, email: str, request: Request):
+    """Unregister a student from an activity. Restricted to logged-in teachers (admin)."""
+    # require teacher permissions
+    require_teacher(request)
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -130,3 +176,34 @@ def unregister_from_activity(activity_name: str, email: str):
     # Remove student
     activity["participants"].remove(email)
     return {"message": f"Unregistered {email} from {activity_name}"}
+
+
+@app.post("/admin/login")
+def admin_login(payload: dict, response: Response):
+    """Login a teacher. Payload: {"username": "...", "password": "..."}
+
+    NOTE: This implementation uses plaintext passwords from `src/teachers.json`.
+    Replace with hashed passwords and secure verification for production.
+    """
+    username = payload.get("username")
+    password = payload.get("password")
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="username and password required")
+
+    if username not in teachers or teachers.get(username) != password:
+        raise HTTPException(status_code=401, detail="invalid credentials")
+
+    token = uuid.uuid4().hex
+    sessions[token] = username
+    # set cookie for browser-based clients
+    response.set_cookie(key="admin_token", value=token, httponly=True, samesite='lax')
+    return {"message": "logged in", "token": token}
+
+
+@app.post("/admin/logout")
+def admin_logout(request: Request, response: Response):
+    token = get_token_from_request(request)
+    if token and token in sessions:
+        del sessions[token]
+    response.delete_cookie("admin_token")
+    return {"message": "logged out"}
